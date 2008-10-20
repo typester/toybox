@@ -1,0 +1,108 @@
+diff --git a/lighttpd-1.4.20/src/Makefile.am b/lighttpd-1.4.20/src/Makefile.am
+index 1008b36..d1738a1 100644
+--- a/lighttpd-1.4.20/src/Makefile.am
++++ b/lighttpd-1.4.20/src/Makefile.am
+@@ -246,6 +246,11 @@ mod_accesslog_la_SOURCES = mod_accesslog.c
+ mod_accesslog_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
+ mod_accesslog_la_LIBADD = $(common_libadd)
+ 
++lib_LTLIBRARIES += mod_postfile.la
++mod_postfile_la_SOURCES = mod_postfile.c
++mod_postfile_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
++mod_postfile_la_LIBADD = $(common_libadd)
++
+ 
+ hdr = server.h buffer.h network.h log.h keyvalue.h \
+       response.h request.h fastcgi.h chunk.h \
+diff --git a/lighttpd-1.4.20/src/connections.c b/lighttpd-1.4.20/src/connections.c
+index 22159b5..c5ba960 100644
+--- a/lighttpd-1.4.20/src/connections.c
++++ b/lighttpd-1.4.20/src/connections.c
+@@ -1039,6 +1039,8 @@ int connection_handle_read_state(server *srv, connection *con)  {
+ 
+ 			toRead = weHave > weWant ? weWant : weHave;
+ 
++            plugins_call_handle_read_post(srv, con, c->mem->ptr + c->offset, toRead);
++
+ 			/* the new way, copy everything into a chunkqueue whcih might use tempfiles */
+ 			if (con->request.content_length > 64 * 1024) {
+ 				chunk *dst_c = NULL;
+diff --git a/lighttpd-1.4.20/src/plugin.c b/lighttpd-1.4.20/src/plugin.c
+index 68eab65..b20874a 100644
+--- a/lighttpd-1.4.20/src/plugin.c
++++ b/lighttpd-1.4.20/src/plugin.c
+@@ -43,6 +43,7 @@ typedef enum {
+ 		PLUGIN_FUNC_HANDLE_JOBLIST,
+ 		PLUGIN_FUNC_HANDLE_DOCROOT,
+ 		PLUGIN_FUNC_HANDLE_PHYSICAL,
++		PLUGIN_FUNC_HANDLE_READ_POST,
+ 		PLUGIN_FUNC_CONNECTION_RESET,
+ 		PLUGIN_FUNC_INIT,
+ 		PLUGIN_FUNC_CLEANUP,
+@@ -273,6 +274,38 @@ PLUGIN_TO_SLOT(PLUGIN_FUNC_CONNECTION_RESET, connection_reset)
+ 
+ #undef PLUGIN_TO_SLOT
+ 
++// PLUGIN_FUNC_HANDLE_READ_POST
++handler_t plugins_call_handle_read_post(server *srv, connection *con, char *buffer, off_t length) {
++    plugin **slot;
++    size_t j;
++
++    if (!srv->plugin_slots) return HANDLER_GO_ON;
++
++    slot = ((plugin ***)(srv->plugin_slots))[PLUGIN_FUNC_HANDLE_READ_POST];
++    if (!slot) return HANDLER_GO_ON;
++
++    for (j = 0; j < srv->plugins.used && slot[j]; j++) {
++        plugin *p = slot[j];
++        handler_t r;
++
++        switch(r = p->handle_read_post(srv, con, p->data, buffer, length)) {
++            case HANDLER_GO_ON:
++                break;
++            case HANDLER_FINISHED:
++            case HANDLER_COMEBACK:
++            case HANDLER_WAIT_FOR_EVENT:
++            case HANDLER_WAIT_FOR_FD:
++            case HANDLER_ERROR:
++                return r;
++            default:
++                log_error_write(srv, __FILE__, __LINE__, "sbs", PLUGIN_FUNC_HANDLE_READ_POST, p->name, "unknown state");
++                return HANDLER_ERROR;
++        }
++    }
++    return HANDLER_GO_ON;
++}
++
++
+ #define PLUGIN_TO_SLOT(x, y) \
+ 	handler_t plugins_call_##y(server *srv) {\
+ 		plugin **slot;\
+@@ -398,6 +431,7 @@ handler_t plugins_call_init(server *srv) {
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_JOBLIST, handle_joblist);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_DOCROOT, handle_docroot);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_PHYSICAL, handle_physical);
++		PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_READ_POST, handle_read_post);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_CONNECTION_RESET, connection_reset);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_CLEANUP, cleanup);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_SET_DEFAULTS, set_defaults);
+diff --git a/lighttpd-1.4.20/src/plugin.h b/lighttpd-1.4.20/src/plugin.h
+index aa64bee..5fd5f0a 100644
+--- a/lighttpd-1.4.20/src/plugin.h
++++ b/lighttpd-1.4.20/src/plugin.h
+@@ -42,6 +42,7 @@ typedef struct {
+ 	handler_t (* handle_uri_clean)       (server *srv, connection *con, void *p_d);    /* after uri is set */
+ 	handler_t (* handle_docroot)         (server *srv, connection *con, void *p_d);    /* getting the document-root */
+ 	handler_t (* handle_physical)        (server *srv, connection *con, void *p_d);    /* mapping url to physical path */
++	handler_t (* handle_read_post)       (server *srv, connection *con, void *p_d, char *buffer, int length);
+ 	handler_t (* handle_request_done)    (server *srv, connection *con, void *p_d);    /* at the end of a request */
+ 	handler_t (* handle_connection_close)(server *srv, connection *con, void *p_d);    /* at the end of a connection */
+ 	handler_t (* handle_joblist)         (server *srv, connection *con, void *p_d);    /* after all events are handled */
+@@ -71,6 +72,7 @@ handler_t plugins_call_handle_subrequest(server *srv, connection *con);
+ handler_t plugins_call_handle_request_done(server *srv, connection *con);
+ handler_t plugins_call_handle_docroot(server *srv, connection *con);
+ handler_t plugins_call_handle_physical(server *srv, connection *con);
++handler_t plugins_call_handle_read_post(server *srv, connection *con, char *buffer, off_t length);
+ handler_t plugins_call_handle_connection_close(server *srv, connection *con);
+ handler_t plugins_call_handle_joblist(server *srv, connection *con);
+ handler_t plugins_call_connection_reset(server *srv, connection *con);
