@@ -156,7 +156,7 @@ handler_t mod_postfile_uri_clean(server *srv, connection *con, void *p_d) {
 
     mod_postfile_patch_connection(srv, con, p);
 
-    if (p->conf.dir->used == 0) return;
+    if (p->conf.dir->used == 0) return HANDLER_GO_ON;
 
     return HANDLER_GO_ON;
 }
@@ -167,7 +167,7 @@ handler_t mod_postfile_read_post(server *srv, connection *con, void *p_d, char *
 
     mod_postfile_patch_connection(srv, con, p);
 
-    if (p->conf.dir->used == 0) return;
+    if (p->conf.dir->used == 0) return HANDLER_GO_ON;
 
     if (con->plugin_ctx[p->id]) {
         hctx = con->plugin_ctx[p->id];
