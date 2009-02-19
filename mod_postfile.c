@@ -194,6 +194,16 @@ handler_t mod_postfile_read_post(server *srv, connection *con, void *p_d, char *
     char *ep = sp + length;
     while (sp < ep) {
         int bytes = write(hctx->fd, sp, ep - sp);
+        if (-1 == bytes) {
+            log_error_write(srv, __FILE__, __LINE__, "sdss",
+                "postfile write failed: (",
+                hctx->fd,
+                strerror(errno),
+                ")"
+            );
+            return HANDLER_GO_ON;
+        }
+
         sp += bytes;
     }
 
