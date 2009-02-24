@@ -398,6 +398,7 @@ typedef struct {
     proxy_connection_state_t proxy_state;
     buffer *proxy_response;
     buffer *proxy_response_header;
+
     chunkqueue *proxy_wb;
 
     int proxy_fd;
@@ -686,7 +687,9 @@ FREE_FUNC(mod_fastcgi_reproxy_free) {
     buffer_free(p->fcgi_env);
     buffer_free(p->path);
     buffer_free(p->parse_response);
+
     buffer_free(p->proxy_parse_response);
+
     buffer_free(p->statuskey);
 
     if (p->config_storage) {
@@ -1569,12 +1572,16 @@ void fcgi_connection_close(server *srv, handler_ctx *hctx) {
         }
     }
 
+
+    proxy_connection_close(srv, hctx);
     handler_ctx_free(hctx);
     con->plugin_ctx[p->id] = NULL;
 }
 
 static int fcgi_reconnect(server *srv, handler_ctx *hctx) {
     plugin_data *p    = hctx->plugin_data;
+
+    log_error_write(srv, __FILE__, __LINE__, "s", "fcgi_reconnect");
 
     /* child died
      *
@@ -3206,7 +3213,6 @@ SUBREQUEST_FUNC(mod_fastcgi_reproxy_handle_subrequest) {
         /* found a server */
         if (ndx == -1) {
             /* all hosts are down */
-
             fcgi_connection_close(srv, hctx);
 
             con->http_status = 500;
@@ -3274,6 +3280,8 @@ SUBREQUEST_FUNC(mod_fastcgi_reproxy_handle_subrequest) {
             return HANDLER_FINISHED;
         }
     case HANDLER_WAIT_FOR_EVENT:
+        if (hctx->proxy_state != PROXY_STATE_INIT) return HANDLER_WAIT_FOR_EVENT;
+
         if (con->file_started == 1) {
             return HANDLER_FINISHED;
         } else {
@@ -3316,6 +3324,7 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
 
                 buffer_copy_string_buffer(con->physical.path, host->docroot);
                 buffer_append_string_buffer(con->physical.path, con->uri.path);
+
                 fcgi_connection_close(srv, hctx);
 
                 con->mode = DIRECT;
@@ -3332,6 +3341,7 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
             }
 
             joblist_append(srv, con);
+
             return HANDLER_FINISHED;
         case -1:
             if (proc->pid && proc->state != PROC_STATE_DIED) {
@@ -3422,6 +3432,7 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
 
 
             joblist_append(srv, con);
+
             return HANDLER_FINISHED;
         }
     }
@@ -3474,6 +3485,7 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
                     hctx->state);
 
             connection_set_state(srv, con, CON_STATE_ERROR);
+
             fcgi_connection_close(srv, hctx);
             joblist_append(srv, con);
         }
@@ -3484,6 +3496,7 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
 
 
         connection_set_state(srv, con, CON_STATE_ERROR);
+
         fcgi_connection_close(srv, hctx);
         joblist_append(srv, con);
     }
@@ -3793,6 +3806,7 @@ JOBLIST_FUNC(mod_fastcgi_reproxy_handle_joblist) {
 
 static handler_t fcgi_connection_close_callback(server *srv, connection *con, void *p_d) {
     plugin_data *p = p_d;
+
     fcgi_connection_close(srv, con->plugin_ctx[p->id]);
 
     return HANDLER_GO_ON;
@@ -3994,7 +4008,6 @@ static int proxy_response_parse(server *srv, connection *con,
     UNUSED(srv);
 
     /* \r\n -> \0\0 */
-
     buffer_copy_string_buffer(p->proxy_parse_response, in);
 
     for (s = p->proxy_parse_response->ptr; NULL != (ns = strstr(s, "\r\n")); s = ns + 2) {
@@ -4069,7 +4082,7 @@ static int proxy_response_parse(server *srv, connection *con,
                 ds = data_response_init();
             }
             buffer_copy_string_len(ds->key, key, key_len);
-            buffer_copy_string_buffer(ds->value, value);
+            buffer_copy_string(ds->value, value);
 
             array_insert_unique(con->response.headers, (data_unset *)ds);
         }
@@ -4188,8 +4201,6 @@ void proxy_connection_close(server *srv, handler_ctx *hctx) {
         close(hctx->proxy_fd);
         srv->cur_fds--;
     }
-
-    fcgi_connection_close(srv, hctx);
 }
 
 static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
@@ -4212,8 +4223,9 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
 
                 case 1:
                     /* we are done */
-                    proxy_connection_close(srv, hctx);
+                    fcgi_connection_close(srv, hctx);
                     joblist_append(srv, con);
+
                     return HANDLER_FINISHED;
 
                 case -1:
@@ -4229,6 +4241,7 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
                     }
 
                     joblist_append(srv, con);
+
                     return HANDLER_FINISHED;
             }
         }
@@ -4236,7 +4249,7 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
 
     if (revents &  FDEVENT_HUP) {
         if (hctx->proxy_state == PROXY_STATE_CONNECT) {
-            proxy_connection_close(srv, hctx);
+            fcgi_connection_close(srv, hctx);
             joblist_append(srv, con);
 
             con->http_status = 503;
@@ -4246,12 +4259,12 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
         }
 
         con->file_finished = 1;
-        proxy_connection_close(srv, con);
+        fcgi_connection_close(srv, con);
         joblist_append(srv, con);
     }
     else if (revents & FDEVENT_ERR) {
         joblist_append(srv, con);
-        proxy_connection_close(srv, hctx);
+        fcgi_connection_close(srv, hctx);
     }
 
     return HANDLER_FINISHED;
@@ -4373,9 +4386,6 @@ static int proxy_create_env(server *srv, handler_ctx *hctx) {
 
     buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
     hctx->proxy_wb->bytes_in += b->used - 1;
-
-    log_error_write(srv, __FILE__, __LINE__, "sb",
-        "request: ", b);
 
     /* ignore body */
     return 0;
@@ -4507,7 +4517,7 @@ static handler_t mod_fastcgi_reproxy_handle_reproxy(server *srv, connection *con
             log_error_write(srv, __FILE__, __LINE__, "sbdd",
                 "TODO: proxy-server disabled");
 
-            proxy_connection_close(srv, hctx);
+            fcgi_connection_close(srv, hctx);
             return HANDLER_ERROR;
         case HANDLER_WAIT_FOR_EVENT:
             return HANDLER_WAIT_FOR_EVENT;
