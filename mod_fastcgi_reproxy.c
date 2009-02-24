@@ -342,8 +342,9 @@ typedef struct {
     buffer *statuskey;
 
     plugin_config **config_storage;
-
     plugin_config conf; /* this is only used as long as no handler_ctx is setup */
+
+    buffer *proxy_parse_response;
 } plugin_data;
 
 /* connection specific data */
@@ -355,6 +356,15 @@ typedef enum {
     FCGI_STATE_WRITE,
     FCGI_STATE_READ
 } fcgi_connection_state_t;
+
+typedef enum {
+    PROXY_STATE_INIT,
+    PROXY_STATE_CONNECT,
+    PROXY_STATE_PREPARE_WRITE,
+    PROXY_STATE_WRITE,
+    PROXY_STATE_READ,
+    PROXY_STATE_ERROR
+} proxy_connection_state_t;
 
 typedef struct {
     fcgi_proc *proc;
@@ -384,11 +394,24 @@ typedef struct {
 
     connection *remote_conn;  /* dumb pointer */
     plugin_data *plugin_data; /* dumb pointer */
+
+    proxy_connection_state_t proxy_state;
+    buffer *proxy_response;
+    buffer *proxy_response_header;
+    chunkqueue *proxy_wb;
+
+    int proxy_fd;
+    int proxy_fde_ndx;
+
+    buffer *reproxy_host;
+    buffer *reproxy_path;
+    int reproxy_port;
 } handler_ctx;
 
 
 /* ok, we need a prototype */
 static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents);
+static handler_t mod_fastcgi_reproxy_handle_reproxy(server *srv, connection *con, void *p_d);
 
 int fastcgi_status_copy_procname(buffer *b, fcgi_extension_host *host, fcgi_proc *proc) {
     buffer_copy_string_len(b, CONST_STR_LEN("fastcgi.backend."));
@@ -449,6 +472,17 @@ static handler_ctx * handler_ctx_init() {
     hctx->rb = chunkqueue_init();
     hctx->wb = chunkqueue_init();
 
+    hctx->proxy_state           = PROXY_STATE_INIT;
+    hctx->proxy_fd              = -1;
+    hctx->proxy_fde_ndx         = -1;
+    hctx->proxy_response        = buffer_init();
+    hctx->proxy_response_header = buffer_init();
+    hctx->proxy_wb              = chunkqueue_init();
+
+    hctx->reproxy_host = buffer_init();
+    hctx->reproxy_path = buffer_init();
+    hctx->reproxy_port = 80;
+
     return hctx;
 }
 
@@ -462,6 +496,13 @@ static void handler_ctx_free(handler_ctx *hctx) {
 
     chunkqueue_free(hctx->rb);
     chunkqueue_free(hctx->wb);
+
+    buffer_free(hctx->proxy_response);
+    buffer_free(hctx->proxy_response_header);
+    chunkqueue_free(hctx->proxy_wb);
+
+    buffer_free(hctx->reproxy_host);
+    buffer_free(hctx->reproxy_path);
 
     free(hctx);
 }
@@ -626,6 +667,8 @@ INIT_FUNC(mod_fastcgi_reproxy_init) {
     p->path = buffer_init();
     p->parse_response = buffer_init();
 
+    p->proxy_parse_response = buffer_init();
+
     p->statuskey = buffer_init();
 
     return p;
@@ -643,6 +686,7 @@ FREE_FUNC(mod_fastcgi_reproxy_free) {
     buffer_free(p->fcgi_env);
     buffer_free(p->path);
     buffer_free(p->parse_response);
+    buffer_free(p->proxy_parse_response);
     buffer_free(p->statuskey);
 
     if (p->config_storage) {
@@ -1244,7 +1288,7 @@ SETDEFAULTS_FUNC(mod_fastcgi_reproxy_set_defaults) {
                     host->disable_time = 60;
                     host->break_scriptfilename_for_php = 0;
                     host->allow_xsendfile = 0; /* handle X-LIGHTTPD-send-file */
-                    host->allow_xreproxy  = 0; /* handle X-LIGHTTPD-reproxy-* */
+                    host->allow_xreproxy = 0;
                     host->kill_signal = SIGTERM;
                     host->fix_root_path_name = 0;
 
@@ -1525,6 +1569,7 @@ void fcgi_connection_close(server *srv, handler_ctx *hctx) {
         }
     }
 
+    proxy_connection_close(srv, hctx);
 
     handler_ctx_free(hctx);
     con->plugin_ctx[p->id] = NULL;
@@ -2594,6 +2639,22 @@ static int fcgi_demux_response(server *srv, handler_ctx *hctx) {
                     }
                 }
 
+                if (host->allow_xreproxy) {
+                    ds = (data_string *)array_get_element(con->response.headers, "X-LIGHTTPD-reproxy-host");
+                    if (NULL != ds && 0 != ds->value->used) {
+                        buffer_copy_string_buffer(hctx->reproxy_host, ds->value);
+                    }
+
+                    ds = (data_string *)array_get_element(con->response.headers, "X-LIGHTTPD-reproxy-path");
+                    if (NULL != ds && 0 != ds->value->used) {
+                        buffer_copy_string_buffer(hctx->reproxy_path, ds->value);
+                    }
+
+                    if ( 0 != hctx->reproxy_host->used && 0 != hctx->reproxy_path->used ) {
+                        hctx->send_content_body = 0;
+                        con->file_started       = 1;
+                    }
+                }
 
                 if (hctx->send_content_body && blen > 1) {
                     /* enable chunked-transfer-encoding */
@@ -3260,7 +3321,12 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
                 con->file_started = 1; /* fcgi_extension won't touch the request afterwards */
             } else {
                 /* we are done */
-                fcgi_connection_close(srv, hctx);
+                if (0 != hctx->reproxy_host->used && 0 != hctx->reproxy_path->used) {
+                    return mod_fastcgi_reproxy_handle_reproxy(srv, con, p);
+                }
+                else {
+                    fcgi_connection_close(srv, hctx);
+                }
             }
 
             joblist_append(srv, con);
@@ -3919,10 +3985,547 @@ TRIGGER_FUNC(mod_fastcgi_reproxy_handle_trigger) {
     return HANDLER_GO_ON;
 }
 
+static int proxy_response_parse(server *srv, connection *con,
+                                plugin_data *p, buffer *in) {
+    char *s, *ns;
+    int   http_response_status = -1;
+
+    UNUSED(srv);
+
+    /* \r\n -> \0\0 */
+
+    buffer_copy_string_buffer(p->proxy_parse_response, in);
+
+    for (s = p->proxy_parse_response->ptr; NULL != (ns = strstr(s, "\r\n")); s = ns + 2) {
+        char        *key, *value;
+        int          key_len;
+        data_string *ds;
+        int          copy_header;
+
+        ns[0] = '\0';
+        ns[1] = '\0';
+
+        if (-1 == http_response_status) {
+            for (key = s; *key && *key != ' '; key++);
+
+            if (*key) {
+                http_response_status = (int)strtol(key, NULL, 10);
+                if (http_response_status <= 0) http_response_status = 502;
+            }
+            else {
+                http_response_status = 502;
+            }
+
+            con->http_status = http_response_status;
+            con->parsed_response |= HTTP_STATUS;
+            continue;
+        }
+
+        if (NULL == (value = strchr(s, ":"))) {
+            /* now we expect: "<key>: <value>\n" */
+            continue;
+        }
+
+        key = s;
+        key_len = value - key;
+
+        value++;
+        /* strip WS */
+        while (*value == ' ' || *value == '\t') value++;
+
+        copy_header = 1;
+
+        switch (key_len) {
+            case 4:
+                if (0 == strncasecmp(key, "Date", key_len)) {
+                    con->parsed_response |= HTTP_DATE;
+                }
+                break;
+            case 8:
+                if (0 == strncasecmp(key, "Location", key_len)) {
+                    con->parsed_response |= HTTP_LOCATION;
+                }
+                break;
+            case 10:
+                if (0 == strncasecmp(key, "Connection", key_len)) {
+                    copy_header = 0;
+                }
+                break;
+            case 14:
+                if (0 == strncasecmp(key, "Content-Length", key_len)) {
+                    con->response.content_length = strtol(value, NULL, 10);
+                    con->parsed_response |= HTTP_CONTENT_LENGTH;
+                }
+                break;
+            default:
+                break;
+        }
+
+        if (copy_header) {
+            ds = (data_string *)array_get_unused_element(
+                con->response.headers, TYPE_STRING);
+            if (NULL == ds) {
+                ds = data_response_init();
+            }
+            buffer_copy_string_len(ds->key, key, key_len);
+            buffer_copy_string_buffer(ds->value, value);
+
+            array_insert_unique(con->response.headers, (data_unset *)ds);
+        }
+    }
+
+    return 0;
+}
+
+static int proxy_demux_response(server *srv, handler_ctx *hctx) {
+    int     fin = 0;
+    int     b;
+    ssize_t r;
+
+    plugin_data *p        = hctx->plugin_data;
+    connection  *con      = hctx->remote_conn;
+    int          proxy_fd = hctx->proxy_fd;
+
+    /* check how much we have to read */
+    if (ioctl(hctx->proxy_fd, FIONREAD, &b)) {
+        log_error_write(srv, __FILE__, __LINE__, "sd",
+            "ioctl failed:", proxy_fd);
+        return -1;
+    }
+
+    if (b > 0) {
+        if (hctx->proxy_response->used == 0) {
+            buffer_prepare_append(hctx->proxy_response, b + 1);
+            hctx->proxy_response->used = 1;
+        }
+        else {
+            buffer_prepare_append(hctx->proxy_response, b);
+        }
+
+        r = read(hctx->proxy_fd, hctx->proxy_response->ptr + hctx->proxy_response->used - 1, b);
+        if (-1 == r) {
+            if (errno == EAGAIN) return 0;
+            log_error_write(srv, __FILE__, __LINE__, "sds",
+                "unexpected end-of-file (perhaps the proxy process died):",
+                proxy_fd, strerror(errno));
+            return -1;
+        }
+
+        assert(r);
+
+        hctx->proxy_response->used += r;
+        hctx->proxy_response->ptr[hctx->proxy_response->used - 1] = '\0';
+
+        if (0 == con->got_response) {
+            con->got_response = 1;
+            //            buffer_prepare_copy(hctx->proxy_response_header, 128);
+        }
+
+        if (0 == con->file_started) {
+            char *c;
+
+            /* search for the \r\n\r\n in the string */
+            c = buffer_search_string_len(hctx->proxy_response, "\r\n\r\n", 4);
+            if (NULL != c) {
+                size_t hlen = c - hctx->proxy_response->ptr + 4;
+                size_t blen = hctx->proxy_response->used - hlen - 1;
+                /* found */
+
+                buffer_append_string_len(
+                    hctx->proxy_response_header, hctx->proxy_response->ptr,
+                    c - hctx->proxy_response->ptr + 4);
+
+                /* parse the response header */
+                proxy_response_parse(srv, con, p, hctx->proxy_response_header);
+
+                /* enable chunked-transfer-encoding */
+                if (con->request.http_version == HTTP_VERSION_1_1 &&
+                    !(con->parsed_response & HTTP_CONTENT_LENGTH)) {
+                    con->response.transfer_encoding = HTTP_TRANSFER_ENCODING_CHUNKED;
+                }
+
+                con->file_started = 1;
+                if (blen) {
+                    http_chunk_append_mem(srv, con, c + 4, blen + 1);
+                    joblist_append(srv, con);
+                }
+                hctx->proxy_response->used = 0;
+            }
+        }
+        else {
+            http_chunk_append_mem(srv, con, hctx->proxy_response->ptr, hctx->proxy_response->used);
+            joblist_append(srv, con);
+            hctx->proxy_response->used = 0;
+        }
+    }
+    else {
+        /* reading from upstream done */
+        con->file_finished = 1;
+
+        http_chunk_append_mem(srv, con, NULL, 0);
+        joblist_append(srv, con);
+
+        fin = 1;
+    }
+
+    return fin;
+}
+
+void proxy_connection_close(server *srv, handler_ctx *hctx) {
+    plugin_data *p;
+    connection  *con;
+
+    if (NULL == hctx) return;
+
+    p   = hctx->plugin_data;
+    con = hctx->remote_conn;
+
+    if (hctx->proxy_fd != -1) {
+        fdevent_event_del(srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd);
+        fdevent_unregister(srv->ev, hctx->proxy_fd);
+
+        close(hctx->proxy_fd);
+        srv->cur_fds--;
+    }
+}
+
+static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
+    server      *srv  = (server *)s;
+    handler_ctx *hctx = ctx;
+    connection  *con  = hctx->remote_conn;
+    plugin_data *p    = hctx->plugin_data;
+
+    if (revents & FDEVENT_OUT) {
+        if (hctx->proxy_state == PROXY_STATE_CONNECT || hctx->proxy_state == PROXY_STATE_WRITE) {
+            return mod_fastcgi_reproxy_handle_reproxy(srv, con, p);
+        }
+    }
+
+    if (revents & FDEVENT_IN) {
+        if (hctx->proxy_state == PROXY_STATE_READ) {
+            switch (proxy_demux_response(srv, hctx)) {
+                case 0:
+                    break;
+
+                case 1:
+                    /* we are done */
+                    fcgi_connection_close(srv, hctx);
+                    joblist_append(srv, con);
+                    return HANDLER_FINISHED;
+
+                case -1:
+                    if (con->file_started == 0) {
+                        /* nothing has been sent out yet, send a 500 */
+                        connection_set_state(srv, con, CON_STATE_HANDLE_REQUEST);
+                        con->http_status = 500;
+                        con->mode = DIRECT;
+                    }
+                    else {
+                        /* response might have been already started, kill the con */
+                        connection_set_state(srv, con, CON_STATE_ERROR);
+                    }
+
+                    joblist_append(srv, con);
+                    return HANDLER_FINISHED;
+            }
+        }
+    }
+
+    if (revents &  FDEVENT_HUP) {
+        if (hctx->proxy_state == PROXY_STATE_CONNECT) {
+            fcgi_connection_close(srv, hctx);
+            joblist_append(srv, con);
+
+            con->http_status = 503;
+            con->mode = DIRECT;
+
+            return HANDLER_FINISHED;
+        }
+
+        con->file_finished = 1;
+        fcgi_connection_close(srv, con);
+        joblist_append(srv, con);
+    }
+    else if (revents & FDEVENT_ERR) {
+        joblist_append(srv, con);
+        fcgi_connection_close(srv, hctx);
+    }
+
+    return HANDLER_FINISHED;
+}
+
+static int proxy_set_state(server *srv, handler_ctx *hctx,
+                           proxy_connection_state_t state) {
+    hctx->proxy_state = state;
+
+    return 0;
+}
+
+static int proxy_establish_connection(server *srv, handler_ctx *hctx) {
+    struct sockaddr    *proxy_addr;
+    struct sockaddr_in  proxy_addr_in;
+    socklen_t           servlen;
+
+    plugin_data *p        = hctx->plugin_data;
+    int          proxy_fd = hctx->proxy_fd;
+    buffer      *host     = hctx->reproxy_host;
+
+    memset(&proxy_addr, 0, sizeof(proxy_addr));
+
+    proxy_addr_in.sin_family      = AF_INET;
+    proxy_addr_in.sin_addr.s_addr = inet_addr(host->ptr);
+    proxy_addr_in.sin_port        = htons(hctx->reproxy_port);
+    servlen = sizeof(proxy_addr_in);
+
+    if (INADDR_NONE == proxy_addr_in.sin_addr.s_addr) {
+        struct hostent *h;
+        h = gethostbyname(host->ptr);
+        if (NULL == host) {
+            log_error_write(srv, __FILE__, __LINE__, "sd",
+                "gethostbyname failed: ", proxy_fd);
+            return -1;
+        }
+        proxy_addr_in.sin_addr.s_addr = *(unsigned int *)h->h_addr_list[0];
+    }
+
+    proxy_addr = (struct sockaddr *)&proxy_addr_in;
+
+    if (-1 == connect(proxy_fd, proxy_addr, servlen)) {
+        if (errno == EINPROGRESS || errno == EALREADY) {
+            log_error_write(srv, __FILE__, __LINE__, "sd",
+                "connect delayed:", proxy_fd);
+            return 1;
+        }
+        else {
+            log_error_write(srv, __FILE__, __LINE__, "sdsd",
+                "connect failed:", proxy_fd, strerror(errno), errno);
+            return -1;
+        }
+    }
+
+    log_error_write(srv, __FILE__, __LINE__, "sd",
+        "connect succeeded:", proxy_fd);
+
+    return 0;
+}
+
+void proxy_set_header(connection *con, const char *key, const char *value) {
+    data_string *ds_dst;
+
+    ds_dst = (data_string *)array_get_unused_element(con->request.headers, TYPE_STRING);
+    if (NULL == ds_dst) {
+        ds_dst = data_string_init();
+    }
+
+    buffer_copy_string(ds_dst->key, key);
+    buffer_append_string(ds_dst->value, value);
+    array_insert_unique(con->request.headers, (data_unset *)ds_dst);
+
+}
+
+static int proxy_create_env(server *srv, handler_ctx *hctx) {
+    size_t       i;
+    connection  *con = hctx->remote_conn;
+    buffer      *b;
+    plugin_data *p   = hctx->plugin_data;
+
+    b = chunkqueue_get_append_buffer(hctx->proxy_wb);
+
+    /* request line */
+    buffer_copy_string(b, get_http_method_name(con->request.http_method));
+    buffer_append_string_len(b, CONST_STR_LEN(" "));
+    buffer_append_string_buffer(b, hctx->reproxy_path);
+    buffer_append_string_len(b, CONST_STR_LEN(" HTTP/1.0\r\n"));
+
+    proxy_set_header(
+        con, "X-Forwarded-For",
+        (char *)inet_ntop_cache_get_ip(srv, &(con->dst_addr))
+    );
+
+    if (con->request.http_host && !buffer_is_empty(con->request.http_host)) {
+        proxy_set_header(con, "X-Host", con->request.http_host->ptr);
+    }
+    proxy_set_header(con, "X-Forwarded-Proto", con->conf.is_ssl ? "https" : "http");
+
+    /* request header */
+    for (i = 0; i < con->request.headers->used; i++) {
+        data_string *ds;
+        ds = (data_string *)con->request.headers->data[i];
+
+        if (ds->value->used && ds->key->used) {
+            if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Connection"))) continue;
+            if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Proxy-Connection"))) continue;
+
+            if (buffer_is_equal_string(ds->key, CONST_STR_LEN("Host"))) {
+                buffer_append_string_len(b, CONST_STR_LEN("Host: "));
+                buffer_append_string_buffer(b, hctx->reproxy_host);
+            }
+            else {
+                buffer_append_string_buffer(b, ds->key);
+                buffer_append_string_len(b, CONST_STR_LEN(": "));
+                buffer_append_string_buffer(b, ds->value);
+            }
+            buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
+        }
+    }
+
+    buffer_append_string_len(b, CONST_STR_LEN("\r\n"));
+    hctx->proxy_wb->bytes_in += b->used - 1;
+
+    log_error_write(srv, __FILE__, __LINE__, "sb",
+        "request: ", b);
+
+    /* ignore body */
+    return 0;
+}
+
+static handler_t proxy_write_request(server *srv, handler_ctx *hctx) {
+    plugin_data *p   = hctx->plugin_data;
+    connection  *con = hctx->remote_conn;
+
+    int ret;
+
+    switch (hctx->proxy_state) {
+        case PROXY_STATE_INIT:
+            if (-1 == (hctx->proxy_fd = socket(AF_INET, SOCK_STREAM, 0))) {
+                log_error_write(
+                    srv, __FILE__, __LINE__,
+                    "ss", "socket failed: ", strerror(errno));
+                return HANDLER_ERROR;
+            }
+            hctx->proxy_fde_ndx = -1;
+            srv->cur_fds++;
+
+            fdevent_register(srv->ev, hctx->proxy_fd, proxy_handle_fdevent, hctx);
+
+            if (-1 == fdevent_fcntl_set(srv->ev, hctx->proxy_fd)) {
+                log_error_write(
+                    srv, __FILE__, __LINE__,
+                    "ss", "fcntl failed: ", strerror(errno));
+                return HANDLER_ERROR;
+            }
+
+        case PROXY_STATE_CONNECT:
+            /* try to finish the connect() */
+            if (hctx->proxy_state == PROXY_STATE_INIT) {
+                switch (proxy_establish_connection(srv, hctx)) {
+                    case 1:
+                        proxy_set_state(srv, hctx, PROXY_STATE_CONNECT);
+                        fdevent_event_add(
+                            srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd, FDEVENT_OUT
+                        );
+
+                        return HANDLER_WAIT_FOR_EVENT;
+
+                    case -1:
+                        log_error_write(srv, __FILE__, __LINE__, "s", "connection error");
+                        hctx->proxy_fde_ndx = -1;
+                        return HANDLER_ERROR;
+
+                    default:
+                        break;
+                }
+            }
+            else {
+                int       socket_error;
+                socklen_t socket_error_len = sizeof(socket_error);
+
+                fdevent_event_del(srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd);
+
+                /* try to finish the connect() */
+                if (0 != getsockopt(hctx->proxy_fd, SOL_SOCKET,
+                        SO_ERROR, &socket_error, &socket_error_len)) {
+                    log_error_write(srv, __FILE__, __LINE__, "ss",
+                        "getsockopt failed:", strerror(errno));
+                    return HANDLER_ERROR;
+                }
+                if (socket_error != 0) {
+                    log_error_write(srv, __FILE__, __LINE__, "ss",
+                        "establishing connection failed", strerror(socket_error));
+                    return HANDLER_ERROR;
+                }
+
+                log_error_write(srv, __FILE__, __LINE__, "s",
+                    "connection delayerd success");
+            }
+            proxy_set_state(srv, hctx, PROXY_STATE_PREPARE_WRITE);
+
+        case PROXY_STATE_PREPARE_WRITE:
+            proxy_create_env(srv, hctx);
+            proxy_set_state(srv, hctx, PROXY_STATE_WRITE);
+
+        case PROXY_STATE_WRITE:
+            ret = srv->network_backend_write(srv, con, hctx->proxy_fd, hctx->proxy_wb);
+            chunkqueue_remove_finished_chunks(hctx->proxy_wb);
+
+            if (-1 == ret) {
+                if (errno != EAGAIN && errno != EINTR) {
+                    log_error_write(srv, __FILE__, __LINE__, "ssd",
+                        "write failed:", strerror(errno), errno);
+                    return HANDLER_ERROR;
+                }
+                else {
+                    fdevent_event_add(srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd, FDEVENT_OUT);
+                    return HANDLER_WAIT_FOR_EVENT;
+                }
+            }
+
+            if (hctx->proxy_wb->bytes_out == hctx->proxy_wb->bytes_in) {
+                proxy_set_state(srv, hctx, PROXY_STATE_READ);
+
+                fdevent_event_del(srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd);
+                fdevent_event_add(srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd, FDEVENT_IN);
+            }
+            else {
+                fdevent_event_add(srv->ev, &(hctx->proxy_fde_ndx), hctx->proxy_fd, FDEVENT_OUT);
+            }
+
+            return HANDLER_WAIT_FOR_EVENT;
+
+        case PROXY_STATE_READ:
+            /* waiting for a response */
+            return HANDLER_WAIT_FOR_EVENT;
+
+        default:
+            log_error_write(srv, __FILE__, __LINE__, "s", "unknown state");
+            return HANDLER_ERROR;
+    }
+
+    return HANDLER_GO_ON;
+}
+
+static handler_t mod_fastcgi_reproxy_handle_reproxy(server *srv, connection *con, void *p_d) {
+    plugin_data *p = p_d;
+    handler_ctx *hctx = con->plugin_ctx[p->id];
+
+    if (NULL == hctx) return HANDLER_GO_ON;
+
+    switch (proxy_write_request(srv, hctx)) {
+        case HANDLER_ERROR:
+            log_error_write(srv, __FILE__, __LINE__, "sbdd",
+                "TODO: proxy-server disabled");
+
+            fcgi_connection_close(srv, hctx);
+            return HANDLER_ERROR;
+        case HANDLER_WAIT_FOR_EVENT:
+            return HANDLER_WAIT_FOR_EVENT;
+        case HANDLER_WAIT_FOR_FD:
+            return HANDLER_WAIT_FOR_FD;
+        default:
+            break;
+    }
+
+    if (con->file_started == 1) {
+        return HANDLER_FINISHED;
+    }
+    else {
+        return HANDLER_WAIT_FOR_EVENT;
+    }
+}
 
 int mod_fastcgi_reproxy_plugin_init(plugin *p) {
     p->version      = LIGHTTPD_VERSION_ID;
-    p->name         = buffer_init_string("fastcgi");
+    p->name         = buffer_init_string("fastcgi_reproxy");
 
     p->init         = mod_fastcgi_reproxy_init;
     p->cleanup      = mod_fastcgi_reproxy_free;
@@ -3939,4 +4542,3 @@ int mod_fastcgi_reproxy_plugin_init(plugin *p) {
 
     return 0;
 }
-
