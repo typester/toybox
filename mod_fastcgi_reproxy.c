@@ -251,6 +251,7 @@ typedef struct {
      *
      */
     unsigned short allow_xsendfile;
+    unsigned short allow_xreproxy;
 
     ssize_t load; /* replace by host->load */
 
@@ -1216,6 +1217,7 @@ SETDEFAULTS_FUNC(mod_fastcgi_reproxy_set_defaults) {
                         { "strip-request-uri",  NULL, T_CONFIG_STRING, T_CONFIG_SCOPE_CONNECTION },      /* 16 */
                         { "kill-signal",        NULL, T_CONFIG_SHORT, T_CONFIG_SCOPE_CONNECTION },      /* 17 */
                         { "fix-root-scriptname",   NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },  /* 18 */
+                        { "allow-x-reproxy",  NULL, T_CONFIG_BOOLEAN, T_CONFIG_SCOPE_CONNECTION },      /* 19 */
 
                         { NULL,                NULL, T_CONFIG_UNSET, T_CONFIG_SCOPE_UNSET }
                     };
@@ -1242,6 +1244,7 @@ SETDEFAULTS_FUNC(mod_fastcgi_reproxy_set_defaults) {
                     host->disable_time = 60;
                     host->break_scriptfilename_for_php = 0;
                     host->allow_xsendfile = 0; /* handle X-LIGHTTPD-send-file */
+                    host->allow_xreproxy  = 0; /* handle X-LIGHTTPD-reproxy-* */
                     host->kill_signal = SIGTERM;
                     host->fix_root_path_name = 0;
 
@@ -1266,6 +1269,7 @@ SETDEFAULTS_FUNC(mod_fastcgi_reproxy_set_defaults) {
                     fcv[16].destination = host->strip_request_uri;
                     fcv[17].destination = &(host->kill_signal);
                     fcv[18].destination = &(host->fix_root_path_name);
+                    fcv[19].destination = &(host->allow_xreproxy);
 
                     if (0 != config_insert_values_internal(srv, da_host->value, fcv)) {
                         return HANDLER_ERROR;
