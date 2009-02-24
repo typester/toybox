@@ -1569,8 +1569,6 @@ void fcgi_connection_close(server *srv, handler_ctx *hctx) {
         }
     }
 
-    proxy_connection_close(srv, hctx);
-
     handler_ctx_free(hctx);
     con->plugin_ctx[p->id] = NULL;
 }
@@ -2496,6 +2494,10 @@ static int fcgi_demux_response(server *srv, handler_ctx *hctx) {
     fcgi_extension_host *host= hctx->host;
     fcgi_proc *proc   = hctx->proc;
 
+    if (hctx->proxy_state != PROXY_STATE_INIT) {
+        return 1;
+    }
+
     /*
      * check how much we have to read
      */
@@ -2652,7 +2654,7 @@ static int fcgi_demux_response(server *srv, handler_ctx *hctx) {
 
                     if ( 0 != hctx->reproxy_host->used && 0 != hctx->reproxy_path->used ) {
                         hctx->send_content_body = 0;
-                        con->file_started       = 1;
+                        con->file_started       = 0;
                     }
                 }
 
@@ -3791,7 +3793,6 @@ JOBLIST_FUNC(mod_fastcgi_reproxy_handle_joblist) {
 
 static handler_t fcgi_connection_close_callback(server *srv, connection *con, void *p_d) {
     plugin_data *p = p_d;
-
     fcgi_connection_close(srv, con->plugin_ctx[p->id]);
 
     return HANDLER_GO_ON;
@@ -4118,7 +4119,7 @@ static int proxy_demux_response(server *srv, handler_ctx *hctx) {
 
         if (0 == con->got_response) {
             con->got_response = 1;
-            //            buffer_prepare_copy(hctx->proxy_response_header, 128);
+            buffer_prepare_copy(hctx->proxy_response_header, 128);
         }
 
         if (0 == con->file_started) {
@@ -4187,6 +4188,8 @@ void proxy_connection_close(server *srv, handler_ctx *hctx) {
         close(hctx->proxy_fd);
         srv->cur_fds--;
     }
+
+    fcgi_connection_close(srv, hctx);
 }
 
 static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
@@ -4209,7 +4212,7 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
 
                 case 1:
                     /* we are done */
-                    fcgi_connection_close(srv, hctx);
+                    proxy_connection_close(srv, hctx);
                     joblist_append(srv, con);
                     return HANDLER_FINISHED;
 
@@ -4233,7 +4236,7 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
 
     if (revents &  FDEVENT_HUP) {
         if (hctx->proxy_state == PROXY_STATE_CONNECT) {
-            fcgi_connection_close(srv, hctx);
+            proxy_connection_close(srv, hctx);
             joblist_append(srv, con);
 
             con->http_status = 503;
@@ -4243,12 +4246,12 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
         }
 
         con->file_finished = 1;
-        fcgi_connection_close(srv, con);
+        proxy_connection_close(srv, con);
         joblist_append(srv, con);
     }
     else if (revents & FDEVENT_ERR) {
         joblist_append(srv, con);
-        fcgi_connection_close(srv, hctx);
+        proxy_connection_close(srv, hctx);
     }
 
     return HANDLER_FINISHED;
@@ -4332,8 +4335,7 @@ static int proxy_create_env(server *srv, handler_ctx *hctx) {
     b = chunkqueue_get_append_buffer(hctx->proxy_wb);
 
     /* request line */
-    buffer_copy_string(b, get_http_method_name(con->request.http_method));
-    buffer_append_string_len(b, CONST_STR_LEN(" "));
+    buffer_copy_string_len(b, CONST_STR_LEN("GET "));
     buffer_append_string_buffer(b, hctx->reproxy_path);
     buffer_append_string_len(b, CONST_STR_LEN(" HTTP/1.0\r\n"));
 
@@ -4505,7 +4507,7 @@ static handler_t mod_fastcgi_reproxy_handle_reproxy(server *srv, connection *con
             log_error_write(srv, __FILE__, __LINE__, "sbdd",
                 "TODO: proxy-server disabled");
 
-            fcgi_connection_close(srv, hctx);
+            proxy_connection_close(srv, hctx);
             return HANDLER_ERROR;
         case HANDLER_WAIT_FOR_EVENT:
             return HANDLER_WAIT_FOR_EVENT;
