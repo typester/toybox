@@ -6,7 +6,7 @@ lighttpd 1.5 might have same feature (X-Rewrite-*) but there's no stable version
 
 ## Build
 
-Following this development instructions: [Lighttpd - HowToWriteALighttpdPlugin - lighty labs](http://redmine.lighttpd.net/projects/lighttpd/wiki/HowToWriteALighttpdPlugin)
+Follow this development instructions: [Lighttpd - HowToWriteALighttpdPlugin - lighty labs](http://redmine.lighttpd.net/projects/lighttpd/wiki/HowToWriteALighttpdPlugin)
 
 ## Usage Example
 
