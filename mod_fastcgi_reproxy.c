@@ -413,6 +413,7 @@ typedef struct {
 /* ok, we need a prototype */
 static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents);
 static handler_t mod_fastcgi_reproxy_handle_reproxy(server *srv, connection *con, void *p_d);
+void proxy_connection_close(server *srv, handler_ctx *hctx);
 
 int fastcgi_status_copy_procname(buffer *b, fcgi_extension_host *host, fcgi_proc *proc) {
     buffer_copy_string_len(b, CONST_STR_LEN("fastcgi.backend."));
@@ -1543,6 +1544,7 @@ void fcgi_connection_close(server *srv, handler_ctx *hctx) {
         fdevent_event_del(srv->ev, &(hctx->fde_ndx), hctx->fd);
         fdevent_unregister(srv->ev, hctx->fd);
         close(hctx->fd);
+        hctx->fd = -1;
         srv->cur_fds--;
     }
 
@@ -1580,8 +1582,6 @@ void fcgi_connection_close(server *srv, handler_ctx *hctx) {
 
 static int fcgi_reconnect(server *srv, handler_ctx *hctx) {
     plugin_data *p    = hctx->plugin_data;
-
-    log_error_write(srv, __FILE__, __LINE__, "s", "fcgi_reconnect");
 
     /* child died
      *
@@ -2969,7 +2969,6 @@ static handler_t fcgi_write_request(server *srv, handler_ctx *hctx) {
             return HANDLER_ERROR;
         }
         hctx->fde_ndx = -1;
-
         srv->cur_fds++;
 
         fdevent_register(srv->ev, hctx->fd, fcgi_handle_fdevent, hctx);
@@ -3333,7 +3332,28 @@ static handler_t fcgi_handle_fdevent(void *s, void *ctx, int revents) {
             } else {
                 /* we are done */
                 if (0 != hctx->reproxy_host->used && 0 != hctx->reproxy_path->used) {
-                    return mod_fastcgi_reproxy_handle_reproxy(srv, con, p);
+                    if (PROXY_STATE_INIT == hctx->proxy_state) {
+                        if (p->conf.debug) {
+                            log_error_write(srv, __FILE__, __LINE__, "sbb",
+                                "reproxy start",
+                                hctx->reproxy_host, hctx->reproxy_path);
+                        }
+
+                        /* close fcgi fdevent */
+                        if (hctx->fd != -1) {
+                            fdevent_event_del(srv->ev, &(hctx->fde_ndx), hctx->fd);
+                            fdevent_unregister(srv->ev, hctx->fd);
+                            close(hctx->fd);
+                            hctx->fd = -1;
+                            srv->cur_fds--;
+                        }
+
+                        /* delegate reproxy event */
+                        return mod_fastcgi_reproxy_handle_reproxy(srv, con, p);
+                    }
+                    else {
+                        return HANDLER_WAIT_FOR_EVENT;
+                    }
                 }
                 else {
                     fcgi_connection_close(srv, hctx);
@@ -4179,6 +4199,11 @@ static int proxy_demux_response(server *srv, handler_ctx *hctx) {
         http_chunk_append_mem(srv, con, NULL, 0);
         joblist_append(srv, con);
 
+        if (p->conf.debug) {
+            log_error_write(srv, __FILE__, __LINE__, "s",
+                "reproxy finished to send content");
+        }
+
         fin = 1;
     }
 
@@ -4200,6 +4225,7 @@ void proxy_connection_close(server *srv, handler_ctx *hctx) {
 
         close(hctx->proxy_fd);
         srv->cur_fds--;
+        hctx->proxy_fd = -1;
     }
 }
 
@@ -4259,7 +4285,7 @@ static handler_t proxy_handle_fdevent(void *s, void *ctx, int revents) {
         }
 
         con->file_finished = 1;
-        fcgi_connection_close(srv, con);
+        fcgi_connection_close(srv, hctx);
         joblist_append(srv, con);
     }
     else if (revents & FDEVENT_ERR) {
@@ -4308,19 +4334,23 @@ static int proxy_establish_connection(server *srv, handler_ctx *hctx) {
 
     if (-1 == connect(proxy_fd, proxy_addr, servlen)) {
         if (errno == EINPROGRESS || errno == EALREADY) {
-            log_error_write(srv, __FILE__, __LINE__, "sd",
-                "connect delayed:", proxy_fd);
+            if (p->conf.debug) {
+                log_error_write(srv, __FILE__, __LINE__, "sd",
+                    "reproxy connect delayed:", proxy_fd);
+            }
             return 1;
         }
         else {
             log_error_write(srv, __FILE__, __LINE__, "sdsd",
-                "connect failed:", proxy_fd, strerror(errno), errno);
+                "reproxy connect failed:", proxy_fd, strerror(errno), errno);
             return -1;
         }
     }
 
-    log_error_write(srv, __FILE__, __LINE__, "sd",
-        "connect succeeded:", proxy_fd);
+    if (p->conf.debug) {
+        log_error_write(srv, __FILE__, __LINE__, "sd",
+            "reproxy connect succeeded:", proxy_fd);
+    }
 
     return 0;
 }
@@ -4457,8 +4487,10 @@ static handler_t proxy_write_request(server *srv, handler_ctx *hctx) {
                     return HANDLER_ERROR;
                 }
 
-                log_error_write(srv, __FILE__, __LINE__, "s",
-                    "connection delayerd success");
+                if (p->conf.debug) {
+                    log_error_write(srv, __FILE__, __LINE__, "s",
+                        "reproxy connection succeeded (delayed)");
+                }
             }
             proxy_set_state(srv, hctx, PROXY_STATE_PREPARE_WRITE);
 
