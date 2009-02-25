@@ -1,14 +1,14 @@
-= mod_fastcgi_reproxy
+# mod_fastcgi_reproxy
 
 This is a module for lighttpd 1.4.x to add perlbal's X-Reproxy-* feature.
 
 lighttpd 1.5 might have same feature (X-Rewrite-*) but there's no stable version.
 
-== Build
+## Build
 
 Following this development instructions: [Lighttpd - HowToWriteALighttpdPlugin - lighty labs](http://redmine.lighttpd.net/projects/lighttpd/wiki/HowToWriteALighttpdPlugin)
 
-== Usage Example
+## Usage Example
 
 lighttpd.conf:
 
@@ -47,7 +47,7 @@ test.fcgi:
         print "Hello fcgi";
     }
 
-== Notes
+## Notes
 
 This module is designed to replace normal fastcgi module. Don't use both modules together.
 
