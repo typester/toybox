@@ -1,0 +1,55 @@
+= mod_fastcgi_reproxy
+
+This is a module for lighttpd 1.4.x to add perlbal's X-Reproxy-* feature.
+
+lighttpd 1.5 might have same feature (X-Rewrite-*) but there's no stable version.
+
+== Build
+
+Following this development instructions: [Lighttpd - HowToWriteALighttpdPlugin - lighty labs](http://redmine.lighttpd.net/projects/lighttpd/wiki/HowToWriteALighttpdPlugin)
+
+== Usage Example
+
+lighttpd.conf:
+
+    server.modules = (
+        "mod_fastcgi_reproxy",
+    )
+    
+    server.document-root = "/home/typester/dev/lighttpd/lighttpd-1.4.21"
+    server.port = 80
+    
+    #fastcgi.debug = 1 # commented out to see debug message
+    fastcgi.server = (
+        "" => (
+            ( "bin-path" => "/home/typester/dev/lighttpd/lighttpd-1.4.21/test.fcgi",
+              "socket" => "/tmp/fcgi.socket",
+              "max-procs" => 1,
+              "check-local" => "disable",
+              "allow-x-reproxy" => "enable",
+            ),
+        ),
+    )
+
+test.fcgi:
+
+    #!/usr/bin/env perl
+    
+    use strict;
+    use warnings;
+    
+    use CGI::Fast qw(:standard);
+    
+    while (my $q = CGI::Fast->new) {
+        print "X-LIGHTTPD-reproxy-host: example.com\n";
+        print "X-LIGHTTPD-reproxy-path: /path/to/target.html\n";
+        print "\n";
+        print "Hello fcgi";
+    }
+
+== Notes
+
+This module is designed to replace normal fastcgi module. Don't use both modules together.
+
+To enable reproxy feature, added "allow-x-reproxy" settings.
+
