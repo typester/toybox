@@ -4322,7 +4322,7 @@ static int proxy_establish_connection(server *srv, handler_ctx *hctx) {
     if (INADDR_NONE == proxy_addr_in.sin_addr.s_addr) {
         struct hostent *h;
         h = gethostbyname(host->ptr);
-        if (NULL == host) {
+        if (NULL == h) {
             log_error_write(srv, __FILE__, __LINE__, "sd",
                 "gethostbyname failed: ", proxy_fd);
             return -1;
